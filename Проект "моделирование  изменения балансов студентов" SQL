@@ -1,0 +1,106 @@
+with 
+-- Шаг 1
+first_payment as (
+    select
+        user_id,
+        min(transaction_datetime::date) as first_payment_date
+    from SKYENG_DB.payments
+    where status_name = 'success'
+    group by 1
+    order by 1
+),
+-- Шаг 2
+all_dates as(
+    select generate_series('2016-01-01'::date, '2016-12-31'::date, '1 day')::date as dt
+),
+-- Шаг 3
+all_dates_by_user as(
+    select
+        t2.user_id,
+        t1.dt
+    from all_dates as t1
+    left join first_payment as t2
+        on t1.dt >= t2.first_payment_date
+),
+-- Шаг 4
+payments_by_dates as(
+    select
+        t1.user_id, 
+        t1.transaction_datetime::date as payment_date, 
+        sum(t1.classes) as transaction_balance_change
+    from SKYENG_DB.payments as t1
+    where status_name = 'success'
+    group by 1,2
+    order by 1
+),
+-- Шаг 5
+payments_by_dates_cumsum as(
+    select 
+        t1.user_id,
+        t1.dt,
+        t2.transaction_balance_change,
+        sum(coalesce(t2.transaction_balance_change, 0.0)) over (partition by t1.user_id order by t1.dt) as transaction_balance_change_cs
+    from all_dates_by_user as t1
+    left join payments_by_dates as t2
+        on t1.user_id = t2.user_id
+        and t1.dt = t2.payment_date
+),
+-- Шаг 6
+classes_by_dates as(
+    select 
+        user_id,
+        class_start_datetime::date as class_date, 
+        -count(id_class) as classes
+    from SKYENG_DB.classes
+    where class_status in ('success', 'failed_by_student') 
+    and class_type !='trial' 
+    group by 1,2
+),
+-- Шаг 7
+classes_by_dates_dates_cumsum as(
+    select
+        t1.user_id,
+        t1.dt,
+        t2.classes,
+        sum(coalesce(t2.classes, 0.0)) over (partition by t1.user_id order by t1.dt) as classes_cs
+    from all_dates_by_user as t1
+    left join classes_by_dates as t2
+        on t1.user_id = t2.user_id
+        and t1.dt = t2.class_date
+),
+-- Шаг 8
+balances as(
+    select 
+        t1.user_id,
+        t1.dt,
+        t1.transaction_balance_change,
+        t1.transaction_balance_change_cs,
+        t2.classes,
+        t2.classes_cs,
+        (t2.classes_cs + t1.transaction_balance_change_cs) as balance
+    from payments_by_dates_cumsum as t1
+    inner join classes_by_dates_dates_cumsum as t2
+        on t1.user_id = t2.user_id 
+        and t1.dt = t2.dt
+)
+-- Задание 1
+-- select * from balances order by 1,2 desc limit 1000;
+/* Вопросы к дата-инженерам и владельцам таблицы:
+1) Почему так много пустых значений в поле class_status? 
+2) При более детальной проверке балансы по урокам не бьются: встречается много балансов < 0
+*/
+
+-- Шаг 9
+select
+    dt,
+    sum(coalesce(transaction_balance_change, 0.0)) as transaction_balance_change,
+    sum(transaction_balance_change_cs) as transaction_balance_change_cs,
+    sum(coalesce(classes,0.0)) as classes,
+    sum(classes_cs) as classes_cs,
+    sum(coalesce(balance, 0.0)) as balance
+from balances 
+group by 1 
+order by 1;
+/*
+Присутствует выраженная сезонность, возможно это связано с выходными/праздниками/каникулами/etc, горящими дедлайнами по домашкам или же рекламными запусками с бесплатными уроками.
+При таких малых выборках будет тяжело делать стат значимую аналитику*/
